@@ -1689,11 +1689,19 @@ class SSHServerChannel(SSHChannel, Generic[AnyStr]):
                        subsystem: Optional[str] = None) -> bool:
         """Tell the session what type of channel is being requested"""
 
-        forced_command = \
+        cert_command = \
             cast(str, self._conn.get_certificate_option('force-command'))
+        key_command = cast(str, self._conn.get_key_option('command'))
 
-        if forced_command is None:
-            forced_command = cast(str, self._conn.get_key_option('command'))
+        if (cert_command is not None and key_command is not None and
+                cert_command != key_command):
+            self.logger.info('  Forced command conflict: certificate '
+                             'force-command %r does not match authorized_keys '
+                             'command %r', cert_command, key_command)
+            return False
+
+        forced_command = \
+            cert_command if cert_command is not None else key_command
 
         if forced_command is not None:
             self.logger.info('  Forced command override: %s', forced_command)

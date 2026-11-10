@@ -548,6 +548,62 @@ class _ChannelServer(Server):
                 return False
 
 
+class _ForcedCommandSession(asyncssh.SSHServerSession):
+    """A session which records what it is asked to run"""
+
+    def __init__(self):
+        self._chan = None
+        self.requests = []
+
+    @property
+    def channel(self):
+        """Return the channel associated with this session"""
+
+        return self._chan
+
+    def connection_made(self, chan):
+        """Handle session open"""
+
+        self._chan = chan
+
+    def shell_requested(self):
+        """Handle shell request"""
+
+        self.requests.append(('shell', None))
+        return True
+
+    def exec_requested(self, command):
+        """Handle exec request"""
+
+        self.requests.append(('exec', command))
+        return True
+
+    def subsystem_requested(self, subsystem):
+        """Handle subsystem request"""
+
+        self.requests.append(('subsystem', subsystem))
+        return True
+
+
+class _ForcedCommandServer(Server):
+    """Server for testing combined forced command enforcement"""
+
+    sessions = []
+
+    def begin_auth(self, username):
+        """Handle client authentication request"""
+
+        self._conn.set_authorized_keys('authorized_keys_' + username)
+        return True
+
+    def session_requested(self):
+        """Handle a request to create a new session"""
+
+        session = _ForcedCommandSession()
+        self.sessions.append(session)
+        return session
+
+
 class _TestChannel(ServerTestCase):
     """Unit tests for AsyncSSH channel API"""
 
@@ -1869,6 +1925,170 @@ class _TestChannel(ServerTestCase):
 
         async with self.connect() as conn:
             await conn.create_session(_ClientSessionCleanupError)
+
+
+class _TestForcedCommand(ServerTestCase):
+    """Unit tests for combined forced command enforcement"""
+
+    @classmethod
+    async def start_server(cls):
+        """Start an SSH server for the tests to use"""
+
+        with open('ckey.pub') as ckey_pub:
+            ckey_pub_data = ckey_pub.read()
+
+        for name, options in (
+                ('match', 'cert-authority,command="recorder-alpha"'),
+                ('conflict', 'cert-authority,command="recorder-beta"'),
+                ('certonly', 'cert-authority'),
+                ('keyonly', 'command="recorder-beta"')):
+            with open(f'authorized_keys_{name}', 'w') as auth_keys:
+                auth_keys.write(options + ' ' + ckey_pub_data)
+
+        return await cls.create_server(_ForcedCommandServer)
+
+    @staticmethod
+    def _make_cert(username, command):
+        """Create a client certificate with a force-command option"""
+
+        ckey = asyncssh.read_private_key('ckey')
+        cert = make_certificate('ssh-rsa-cert-v01@openssh.com',
+                                CERT_TYPE_USER, ckey, ckey, [username],
+                                options={'force-command': String(command)})
+        return ckey, cert
+
+    async def _check_forced_command(self, username, client_keys,
+                                    expected_requests,
+                                    command='client-command', **kwargs):
+        """Check the requests a forced command session receives"""
+
+        _ForcedCommandServer.sessions = []
+
+        async with self.connect(username=username, client_keys=client_keys,
+                                agent_path=None) as conn:
+            chan, _ = await _create_session(conn, command, **kwargs)
+            chan.close()
+            await chan.wait_closed()
+
+        self.assertEqual(_ForcedCommandServer.sessions[-1].requests,
+                         expected_requests)
+
+    async def _check_forced_command_failure(self, username,
+                                            command='client-command',
+                                            **kwargs):
+        """Check a forced command conflict rejects the session request"""
+
+        _ForcedCommandServer.sessions = []
+
+        ckey, cert = self._make_cert(username, 'recorder-alpha')
+
+        async with self.connect(username=username,
+                                client_keys=[(ckey, cert)],
+                                agent_path=None) as conn:
+            with self.assertRaises(asyncssh.ChannelOpenError):
+                await _create_session(conn, command, **kwargs)
+
+        session = _ForcedCommandServer.sessions[-1]
+        self.assertEqual(session.requests, [])
+        self.assertFalse(session.channel._session_started) # pylint: disable=protected-access
+
+    @asynctest
+    async def test_forced_exec_match(self):
+        """Test matching forced commands in certificate and authorized_keys"""
+
+        ckey, cert = self._make_cert('match', 'recorder-alpha')
+        await self._check_forced_command('match', [(ckey, cert)],
+                                         [('exec', 'recorder-alpha')])
+
+    @asynctest
+    async def test_forced_shell_match(self):
+        """Test matching forced commands with a shell request"""
+
+        ckey, cert = self._make_cert('match', 'recorder-alpha')
+        await self._check_forced_command('match', [(ckey, cert)],
+                                         [('exec', 'recorder-alpha')],
+                                         command=None)
+
+    @asynctest
+    async def test_forced_subsystem_match(self):
+        """Test matching forced commands with a subsystem request"""
+
+        ckey, cert = self._make_cert('match', 'recorder-alpha')
+        await self._check_forced_command('match', [(ckey, cert)],
+                                         [('exec', 'recorder-alpha')],
+                                         subsystem='sftp')
+
+    @asynctest
+    async def test_forced_exec_cert_only(self):
+        """Test forced command from certificate only"""
+
+        ckey, cert = self._make_cert('certonly', 'recorder-alpha')
+        await self._check_forced_command('certonly', [(ckey, cert)],
+                                         [('exec', 'recorder-alpha')])
+
+    @asynctest
+    async def test_forced_exec_key_only(self):
+        """Test forced command from authorized_keys only"""
+
+        ckey = asyncssh.read_private_key('ckey')
+        await self._check_forced_command('keyonly', [ckey],
+                                         [('exec', 'recorder-beta')])
+
+    @asynctest
+    async def test_forced_exec_conflict(self):
+        """Test conflicting forced commands with an exec request"""
+
+        await self._check_forced_command_failure('conflict')
+
+    @asynctest
+    async def test_forced_shell_conflict(self):
+        """Test conflicting forced commands with a shell request"""
+
+        await self._check_forced_command_failure('conflict', command=None)
+
+    @asynctest
+    async def test_forced_subsystem_conflict(self):
+        """Test conflicting forced commands with a subsystem request"""
+
+        await self._check_forced_command_failure('conflict',
+                                                 subsystem='sftp')
+
+    @asynctest
+    async def test_forced_exec_multiple(self):
+        """Test multiple exec requests on a forced command channel"""
+
+        ckey, cert = self._make_cert('match', 'recorder-alpha')
+
+        _ForcedCommandServer.sessions = []
+
+        with patch('asyncssh.connection.SSHClientChannel', _ClientChannel):
+            async with self.connect(username='match',
+                                    client_keys=[(ckey, cert)],
+                                    agent_path=None) as conn:
+                with self.assertRaises(asyncssh.ChannelOpenError):
+                    await _create_session(conn, 'exec_multiple')
+
+        self.assertEqual(_ForcedCommandServer.sessions[-1].requests,
+                         [('exec', 'recorder-alpha')])
+
+    @asynctest
+    async def test_forced_exec_multiple_conflict(self):
+        """Test multiple exec requests on a conflicting channel"""
+
+        ckey, cert = self._make_cert('conflict', 'recorder-alpha')
+
+        _ForcedCommandServer.sessions = []
+
+        with patch('asyncssh.connection.SSHClientChannel', _ClientChannel):
+            async with self.connect(username='conflict',
+                                    client_keys=[(ckey, cert)],
+                                    agent_path=None) as conn:
+                with self.assertRaises(asyncssh.ChannelOpenError):
+                    await _create_session(conn, 'exec_multiple')
+
+        session = _ForcedCommandServer.sessions[-1]
+        self.assertEqual(session.requests, [])
+        self.assertFalse(session.channel._session_started) # pylint: disable=protected-access
 
 
 class _TestInvalidMaxPktsizeServer(ServerTestCase):
