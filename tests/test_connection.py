@@ -816,6 +816,46 @@ class _TestConnection(ServerTestCase):
             self.assertEqual(conn.get_server_host_key(), keylist[0])
 
     @asynctest
+    async def test_known_hosts_port_revoked(self):
+        """Test port-specific revoked key isn't overridden by portless entry"""
+
+        auth_attempts = []
+
+        class _AuthRecordingServer(Server):
+            """Server which records client authentication attempts"""
+
+            def begin_auth(self, username):
+                """Record a client authentication attempt"""
+
+                auth_attempts.append(username)
+                return super().begin_auth(username)
+
+        with open('skey.pub') as f:
+            skey = f.read().strip()
+
+        async with self.listen(server_factory=_AuthRecordingServer) as server:
+            port = server.get_port()
+
+            known_hosts = (f'@revoked [127.0.0.1]:{port} {skey}\n'
+                           f'127.0.0.1 {skey}\n').encode()
+
+            with self.assertRaises(asyncssh.HostKeyNotVerifiable) as cm:
+                await self.connect(port=port, username='user',
+                                   known_hosts=known_hosts)
+
+            self.assertIn('revoked', str(cm.exception))
+
+            # The key must be rejected during key exchange, before
+            # user authentication begins
+            self.assertEqual(auth_attempts, [])
+
+        # The same known_hosts must still allow connecting on other ports
+        async with self.listen(server_factory=_AuthRecordingServer) as server:
+            async with self.connect(port=server.get_port(),
+                                    known_hosts=known_hosts):
+                pass
+
+    @asynctest
     async def test_read_known_hosts(self):
         """Test connecting with known hosts object from read_known_hosts"""
 

@@ -255,6 +255,10 @@ class SSHKnownHosts:
 
            If the port is not the default port and no match is found
            for it, the lookup is attempted again without a port number.
+           Revoked keys, certificates, and subject names matched in
+           the port-specific lookup are retained even when this
+           fallback occurs, so a port-specific revocation can't be
+           overridden by a less specific entry.
 
            :param host:
                The hostname of the target host
@@ -275,8 +279,19 @@ class SSHKnownHosts:
             x509_subjects, revoked_subjects = self._match(host, addr, port)
 
         if port and not (host_keys or ca_keys or x509_certs or x509_subjects):
-            host_keys, ca_keys, revoked_keys, x509_certs, revoked_certs, \
-                x509_subjects, revoked_subjects = self._match(host, addr)
+            fallback_host_keys, fallback_ca_keys, fallback_revoked_keys, \
+                fallback_x509_certs, fallback_revoked_certs, \
+                fallback_x509_subjects, fallback_revoked_subjects = \
+                    self._match(host, addr)
+
+            host_keys = fallback_host_keys
+            ca_keys = fallback_ca_keys
+            x509_certs = fallback_x509_certs
+            x509_subjects = fallback_x509_subjects
+
+            revoked_keys += fallback_revoked_keys
+            revoked_certs += fallback_revoked_certs
+            revoked_subjects += fallback_revoked_subjects
 
         return (host_keys, ca_keys, revoked_keys, x509_certs, revoked_certs,
                 x509_subjects, revoked_subjects)
@@ -346,6 +361,10 @@ def match_known_hosts(known_hosts: KnownHostsArg, host: str,
 
        If the port is not the default port and no match is found
        for it, the lookup is attempted again without a port number.
+       Revoked keys, certificates, and subject names matched in
+       the port-specific lookup are retained even when this
+       fallback occurs, so a port-specific revocation can't be
+       overridden by a less specific entry.
 
        :param known_hosts:
            The host patterns to match against

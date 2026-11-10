@@ -198,6 +198,51 @@ class _TestKnownHosts(TempDirTestCase):
         self.check_hosts((['[host]:22'], [], [], [], [], [], []),
                          ([], [], [], [], [], [], []), port=None)
 
+    def test_port_fallback_keeps_revoked(self):
+        """Test port-specific revoked entries survive port fallback"""
+
+        self.check_hosts((['host'], [], ['[host]:2222'], [], [], [], []),
+                         ([0], [], [0], [], [], [], []), port=2222)
+        self.check_hosts((['1.2.3.4'], [], ['[1.2.3.4]:2222'], [], [], [], []),
+                         ([0], [], [0], [], [], [], []), port=2222)
+        self.check_hosts(([_hash('host')], [], [_hash('[host]:2222')],
+                          [], [], [], []),
+                         ([0], [], [0], [], [], [], []), port=2222)
+        self.check_hosts(([], ['host'], ['[host]:2222'], [], [], [], []),
+                         ([], [0], [0], [], [], [], []), port=2222)
+
+        if x509_available: # pragma: no branch
+            self.check_hosts(([], [], [], ['host'], ['[host]:2222'], [], []),
+                             ([], [], [], [0], [0], [], []), port=2222)
+            self.check_hosts(([], [], [], [], [], ['host'], ['[host]:2222']),
+                             ([], [], [], [], [], [0], [0]), port=2222)
+
+    def test_port_fallback_revoked_other_port(self):
+        """Test revoked entry for another port isn't applied"""
+
+        self.check_hosts((['host'], [], ['[host]:2223'], [], [], [], []),
+                         ([0], [], [], [], [], [], []), port=2222)
+        self.check_hosts((['host'], [], ['[host]:2222'], [], [], [], []),
+                         ([0], [], [], [], [], [], []), port=None)
+
+    def test_port_fallback_revoked_order(self):
+        """Test entry order doesn't change port fallback result"""
+
+        key = self.keylists[0][0]
+        imported_key = self.imported_keylists[0][0]
+
+        results = []
+
+        for lines in ((f'@revoked [host]:2222 {key}', f'host {key}'),
+                      (f'host {key}', f'@revoked [host]:2222 {key}')):
+            known_hosts = asyncssh.import_known_hosts(''.join(lines))
+            results.append(asyncssh.match_known_hosts(known_hosts, 'host',
+                                                      '1.2.3.4', 2222))
+
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[0][0], [imported_key])
+        self.assertEqual(results[0][2], [imported_key])
+
     def test_no_match(self):
         """Test for cases where no match is found"""
 
