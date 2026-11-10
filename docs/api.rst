@@ -1968,6 +1968,91 @@ Supported options are:
     An indicator that this entry's key is only valid before the specified
     time. See :ref:`SpecifyingTimeValues` for allowed time specifications.
 
+.. index:: Release verification contract
+.. _ReleaseVerificationContract:
+
+Release verification contract
+-----------------------------
+
+When SSHSIG is used to approve a release, two distinct questions must be
+kept separate. Conflating them is what allows a signature that is valid
+for some other business purpose to be mistaken for a release approval.
+
+What ``validate_sshsig`` actually proves
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+:func:`validate_sshsig` performs the *cryptographic* portion of the check:
+
+  * it parses the armored or raw blob and rejects structural problems such
+    as a bad magic or version, an undecodable key, trailing data after the
+    final field, or truncated fields;
+  * it recomputes ``SSHSIG || namespace || reserved || hash_alg ||
+    hash(message)`` from the message and the namespace/hash claims carried
+    in the signature;
+  * it runs the public key's ``verify`` against the embedded signature.
+
+It does not, on its own, decide whether the signature is *authorized* for
+your use case. In particular:
+
+  * the public key embedded in the blob is the key the signer chose to
+    present. It verifies the signature, but any party can generate a key
+    and self-sign, so that embedded key is never a trust anchor;
+  * trust comes only from the operator-provided allowed signers data,
+    matched by principal (and, for certificates, the certificate's own
+    principals and validity period);
+  * a signature made for another namespace verifies perfectly when no
+    namespace restriction is configured. Pinning the expected namespace is
+    therefore the caller's responsibility.
+
+Checks the caller must enforce
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A release verifier (see ``examples/verify_release.py`` for a complete,
+runnable example) should layer these policy gates on top of the
+cryptographic check:
+
+  1. **Expected namespace.** Require the namespace parsed from the blob to
+     equal the single namespace the release flow pins (for example
+     ``"release"``). Belt and suspenders: also express it through the
+     ``namespaces`` option on the allowed signers entry so AsyncSSH
+     enforces it independently.
+  2. **Signer authorization.** Accept the signature only when the embedded
+     key matches an allowed signers entry for the expected principal. Do
+     not treat the embedded key as trusted merely because it verifies.
+  3. **Digest policy.** Restrict the declared hash to the algorithms the
+     release accepts (currently ``sha256`` and ``sha512``). An unknown
+     declared hash raises ``ValueError`` rather than returning ``False``,
+     so callers should map that to a rejection rather than letting it
+     escape.
+
+The table below summarizes the example's positive and negative cases.
+Each negative row except the two structural rows keeps a syntactically
+well-formed blob; the namespace and unauthorized-signer rows even keep a
+cryptographically valid signature, so they genuinely exercise policy
+isolation rather than merely corrupting signature bytes.
+
+==============================================  ==========  =====================================
+Input                                           Verdict     Reason
+==============================================  ==========  =====================================
+ed25519/rsa/ecdsa signature, ``release`` ns     ACCEPTED    key authorized, namespace and hash ok
+Same key, valid signature under ``file`` ns     REJECTED    namespace does not match ``release``
+Valid signature, key absent from allowed list   REJECTED    signer not authorized for principal
+Message changed after signing                   REJECTED    cryptographic verify fails
+Declared hash rewritten to ``sha1``             REJECTED    digest outside release policy
+Trailing byte appended to blob                  REJECTED    unexpected data at end of packet
+Final field truncated                           REJECTED    incomplete packet
+==============================================  ==========  =====================================
+
+Removing the namespace gate (both the explicit check and the
+``namespaces`` option) makes the ``file`` row flip to ACCEPTED; the
+associated tests assert this so the purpose-isolation control cannot be
+silently dropped.
+
+The complete verifier, including the counterexample table, lives in
+``examples/verify_release.py`` and is exercised by
+``tests/test_verify_release.py``. It generates short-lived local keys and
+a short message, so it runs without any external key material.
+
 SSHSIG classes/functions
 ------------------------
 

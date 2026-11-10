@@ -25,7 +25,7 @@ import os
 
 import asyncssh
 
-from asyncssh.packet import String, UInt32
+from asyncssh.packet import SSHPacket, String, UInt32
 
 from .util import TempDirTestCase, get_test_key
 
@@ -244,6 +244,131 @@ class _TestSSHSIG(TempDirTestCase):
                 sig = asyncssh.create_sshsig(keypair, data)
                 self.assertFalse(asyncssh.validate_sshsig(
                     data, sig, principal, allowed_signers.encode()))
+
+    def test_sshsig_namespace_purpose_isolation(self):
+        """Test that a signature for another namespace is not accepted
+
+           The signature below is cryptographically valid and made by an
+           authorized key, but it was created for the 'file' namespace. A
+           release flow pinning 'release' must reject it. This guards the
+           purpose-isolation contract: namespace checks belong to the
+           caller's policy (here expressed through the namespaces option),
+           not to the raw key verification.
+        """
+
+        data = os.urandom(64)
+        file_sig = asyncssh.create_sshsig(self._rsa_keypair, data,
+                                          namespace='file')
+        release_sig = asyncssh.create_sshsig(self._rsa_keypair, data,
+                                             namespace='release')
+
+        signers = self._build_signers(
+            (('*', 'namespaces="release"', self._rsa_keypair),)).encode()
+
+        # The same valid signature passes when the table does not pin a
+        # namespace, proving the rejection below is a policy decision and
+        # not a cryptographic failure.
+        permissive = self._build_signers(
+            (('*', None, self._rsa_keypair),)).encode()
+        self.assertTrue(asyncssh.validate_sshsig(
+            data, file_sig, 'principal', permissive))
+
+        self.assertFalse(asyncssh.validate_sshsig(
+            data, file_sig, 'principal', signers))
+        self.assertTrue(asyncssh.validate_sshsig(
+            data, release_sig, 'principal', signers))
+
+    def test_sshsig_unauthorized_signer(self):
+        """Test that a valid signature from a non-listed key is rejected
+
+           The public key embedded in an SSHSIG is only a claim of identity.
+           Verification against it must never be treated as authorization;
+           the allowed signers table is the sole trust anchor.
+        """
+
+        data = os.urandom(64)
+        sig = asyncssh.create_sshsig(self._missing_keypair, data)
+
+        signers = self._build_signers(
+            (('*', None, self._rsa_keypair),)).encode()
+
+        self.assertFalse(asyncssh.validate_sshsig(
+            data, sig, 'principal', signers))
+
+    def test_sshsig_message_binding(self):
+        """Test that changing the message invalidates the signature"""
+
+        data = os.urandom(64)
+        sig = asyncssh.create_sshsig(self._rsa_keypair, data)
+
+        signers = self._build_signers(
+            (('*', None, self._rsa_keypair),)).encode()
+
+        self.assertTrue(asyncssh.validate_sshsig(
+            data, sig, 'principal', signers))
+        self.assertFalse(asyncssh.validate_sshsig(
+            data + b'x', sig, 'principal', signers))
+
+    def test_sshsig_trailing_and_truncated_blob(self):
+        """Test that extra trailing data and truncated fields are refused
+
+           The SSHSIG packet parser consumes the whole blob, so any trailing
+           bytes or a cut-off final field fail structural validation rather
+           than being silently accepted.
+        """
+
+        data = os.urandom(64)
+        raw_sig = asyncssh.create_sshsig(self._rsa_keypair, data, raw=True)
+        signers = self._build_signers(
+            (('*', None, self._rsa_keypair),)).encode()
+
+        self.assertFalse(asyncssh.validate_sshsig(
+            data, raw_sig + b'trailing', 'principal', signers))
+        self.assertFalse(asyncssh.validate_sshsig(
+            data, raw_sig[:-8], 'principal', signers))
+
+    def test_sshsig_unsupported_hash_declaration(self):
+        """Test that an unknown declared digest cannot be used
+
+           The hash name is attacker-controlled data inside the blob.
+           An unsupported value surfaces as a ValueError so callers can map
+           it to a policy rejection rather than a verified signature.
+        """
+
+        data = os.urandom(64)
+        raw_sig = asyncssh.create_sshsig(self._rsa_keypair, data, raw=True)
+
+        packet = SSHPacket(raw_sig)
+        packet.get_bytes(6)
+        packet.get_uint32()
+        pubdata = packet.get_string()
+        namespace = packet.get_string()
+        reserved = packet.get_string()
+        packet.get_string()
+        signature = packet.get_string()
+
+        bad_sig = b'SSHSIG' + UInt32(1) + String(pubdata) + \
+            String(namespace) + String(reserved) + String(b'sha1') + \
+            String(signature)
+
+        with self.assertRaises(ValueError):
+            asyncssh.validate_sshsig(data, bad_sig, 'principal', b'')
+
+    def test_sshsig_supported_key_types(self):
+        """Test legal controls across the supported public key types"""
+
+        data = os.urandom(64)
+
+        for alg_name in ('ssh-rsa', 'ecdsa-sha2-nistp256',
+                         'ssh-ed25519'):
+            with self.subTest(alg_name=alg_name):
+                keypair = get_test_key(alg_name, 0)
+                sig = asyncssh.create_sshsig(keypair, data)
+                signers = self._build_signers(
+                    (('*', None, keypair),)).encode()
+
+                self.assertTrue(asyncssh.validate_sshsig(
+                    data, sig, 'principal', signers))
 
     def test_sshsig(self):
         """Test creating and verifying SSHSIG signatures"""
