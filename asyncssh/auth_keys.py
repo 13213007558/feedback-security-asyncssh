@@ -45,11 +45,24 @@ _EntryOptions = Mapping[str, object]
 class _SSHAuthorizedKeyEntry(OptionsParser):
     """An entry in an SSH authorized_keys list"""
 
+    # Capability options controlled by the OpenSSH "restrict" option,
+    # mapped to the permission names used by check_key_permission()
+    _restrict_capabilities = {
+        'pty':              'pty',
+        'port-forwarding':  'port-forwarding',
+        'agent-forwarding': 'agent-forwarding',
+        'x11-forwarding':   'X11-forwarding',
+        'user-rc':          'user-rc'
+    }
+
     def __init__(self, line: str):
         super().__init__()
 
         self.key: Optional[SSHKey] = None
         self.cert: Optional[SSHX509Certificate] = None
+
+        self._restrict = False
+        self._capabilities: Dict[str, bool] = {}
 
         try:
             self._import_key_or_cert(line)
@@ -58,7 +71,48 @@ class _SSHAuthorizedKeyEntry(OptionsParser):
             pass
 
         line = self._parse_options(line)
+
+        if self._restrict:
+            self._apply_restrict()
+
         self._import_key_or_cert(line)
+
+    def _add_option(self, option: str) -> None:
+        """Add an option, tracking restrict and capability flags"""
+
+        if '=' not in option:
+            name = option.lower()
+
+            if name == 'restrict':
+                self._restrict = True
+            elif name in self._restrict_capabilities:
+                self._capabilities[name] = True
+            elif (name.startswith('no-') and
+                    name[3:] in self._restrict_capabilities):
+                self._capabilities[name[3:]] = False
+
+        super()._add_option(option)
+
+    def _apply_restrict(self) -> None:
+        """Apply the OpenSSH "restrict" option to this entry
+
+           When "restrict" is set, all of the capabilities it controls
+           are disabled except those explicitly re-enabled with a
+           capability option (such as "pty" or "port-forwarding"). An
+           explicit capability setting always takes precedence over
+           "restrict", regardless of the order the options appear in.
+           When a capability and its "no-" form are both present, the
+           last occurrence in the entry wins.
+
+        """
+
+        for name, permission in self._restrict_capabilities.items():
+            if self._capabilities.get(name, False):
+                for option in list(self.options):
+                    if option.lower() == 'no-' + name:
+                        del self.options[option]
+            else:
+                self.options['no-' + permission] = True
 
     def _import_key_or_cert(self, line: str) -> None:
         """Import key or certificate in this entry"""

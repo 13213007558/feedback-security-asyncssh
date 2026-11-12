@@ -1874,6 +1874,28 @@ from and principals options to restrict key matching, enforcement
 of no-X11-forwarding, no-agent-forwarding, no-pty, no-port-forwarding,
 and permitopen options, and support for command and environment options.
 
+The OpenSSH restrict option is also supported. It revokes the PTY,
+port forwarding, agent forwarding, X11 forwarding, and user-rc
+permissions for the key, after which individual capabilities can be
+explicitly re-enabled with the pty, port-forwarding, agent-forwarding,
+x11-forwarding, and user-rc options. Re-enabling one capability does
+not re-enable any of the others. An explicit capability option always
+takes precedence over restrict regardless of option order, and when a
+capability and its "no-" form are both present, the last occurrence
+wins. Since AsyncSSH does not run user login scripts, the user-rc
+permission is tracked but not enforced.
+
+For example, the following authorized_keys entry disables all of these
+capabilities and forces a single fixed command::
+
+    restrict,command="/usr/local/bin/backup" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE...
+
+This next entry additionally re-enables PTY allocation, while leaving
+port forwarding, agent forwarding, X11 forwarding, and user-rc
+disabled::
+
+    restrict,pty,command="/usr/local/bin/backup" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE...
+
 .. index:: Specifying authorized keys
 .. _SpecifyingAuthorizedKeys:
 

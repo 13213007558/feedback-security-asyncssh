@@ -155,6 +155,56 @@ class _TestAuthorizedKeys(TempDirTestCase):
 
         self.build_keys([None], from_file=True)
 
+    def test_restrict(self):
+        """Test OpenSSH restrict option and capability switches"""
+
+        all_denied = {'no-pty': True, 'no-port-forwarding': True,
+                      'no-agent-forwarding': True, 'no-X11-forwarding': True,
+                      'no-user-rc': True}
+
+        tests = (
+            ('Restrict all', 'restrict',
+             {'restrict': True, **all_denied}),
+            ('Restrict with PTY restored', 'restrict,pty',
+             {'restrict': True, 'pty': True,
+              **{k: v for k, v in all_denied.items() if k != 'no-pty'}}),
+            ('Restrict after PTY restores it', 'pty,restrict',
+             {'restrict': True, 'pty': True,
+              **{k: v for k, v in all_denied.items() if k != 'no-pty'}}),
+            ('Restore is case-insensitive', 'Restrict,PTY',
+             {'Restrict': True, 'PTY': True,
+              **{k: v for k, v in all_denied.items() if k != 'no-pty'}}),
+            ('Restore multiple capabilities',
+             'restrict,port-forwarding,agent-forwarding,x11-forwarding',
+             {'restrict': True, 'port-forwarding': True,
+              'agent-forwarding': True, 'x11-forwarding': True,
+              'no-pty': True, 'no-user-rc': True}),
+            ('Restore user-rc', 'restrict,user-rc',
+             {'restrict': True, 'user-rc': True,
+              **{k: v for k, v in all_denied.items()
+                 if k != 'no-user-rc'}}),
+            ('Explicit deny after restore wins', 'restrict,pty,no-pty',
+             {'restrict': True, 'pty': True, **all_denied}),
+            ('Explicit restore after deny wins', 'restrict,no-pty,pty',
+             {'restrict': True, 'pty': True,
+              **{k: v for k, v in all_denied.items() if k != 'no-pty'}}),
+            ('Explicit deny of X11 with restrict', 'restrict,no-x11-forwarding',
+             {'restrict': True, 'no-x11-forwarding': True, **all_denied}),
+            ('Restrict with value is not a flag', 'restrict=xxx',
+             {'restrict': ['xxx']}),
+            ('Capability without restrict is unchanged', 'pty',
+             {'pty': True}),
+            ('Denied capability without restrict is unchanged', 'no-pty',
+             {'no-pty': True})
+        )
+
+        for msg, options, expected in tests:
+            with self.subTest(msg):
+                auth_keys = self.build_keys([options])
+                result = auth_keys.validate(self.imported_keylist[0],
+                                            '1.2.3.4', None, False)
+                self.assertEqual(result, expected)
+
     @unittest.skipUnless(x509_available, 'X.509 not available')
     def test_subject_match(self):
         """Test match on X.509 subject name"""

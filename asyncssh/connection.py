@@ -6895,6 +6895,7 @@ class SSHServerConnection(SSHConnection):
                | no-touch-required (boolean)
                | permitopen (list of host/port tuples)
                | principals (list of usernames)
+               | restrict (boolean)
 
            Non-standard options are also supported and will return the
            value `True` if the option is present without a value or
@@ -6935,6 +6936,16 @@ class SSHServerConnection(SSHConnection):
            AsyncSSH internally enforces X11-forwarding, agent-forwarding,
            port-forwarding and pty permissions but ignores user-rc since
            it does not implement that feature.
+
+           If the authorized_keys entry contains the OpenSSH 'restrict'
+           option, all of the above permissions are revoked except those
+           explicitly re-enabled with a capability option of the same
+           name (for instance 'pty' or 'port-forwarding'). An explicit
+           capability option always takes precedence over 'restrict',
+           regardless of the order the options appear in. If a capability
+           and its 'no-' form are both present, the last occurrence in
+           the entry wins. For example, 'restrict,pty' allows only PTY
+           allocation, while 'restrict,pty,no-pty' denies it again.
 
            Non-standard permissions can also be checked, as long as the
            option follows the convention of starting with 'no-'.
