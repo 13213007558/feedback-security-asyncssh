@@ -3,6 +3,20 @@
 Change Log
 ==========
 
+Release 2.24.2 (under development)
+----------------------------------
+
+* Added support for the permitlisten option in authorized_keys files,
+  restricting the TCP/IP addresses and ports a client may use to set up
+  remote listeners. Matching is done on the text of the requested address
+  without treating equivalent IP forms as interchangeable, and dynamic
+  port allocation (port 0) is only permitted when explicitly authorized.
+  Remote listener requests are now fully enforced against this policy and
+  cancellation of dynamically assigned listeners is tracked so that the
+  correct listener is closed without leaving ports open. Requests to
+  cancel unknown TCP/IP listeners now return a clean failure response
+  instead of tearing down the connection.
+
 Release 2.24.1 (3 Oct 2026)
 ---------------------------
 

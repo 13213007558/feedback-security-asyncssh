@@ -130,6 +130,29 @@ class _SSHAuthorizedKeyEntry(OptionsParser):
                                self.options.setdefault(option, set()))
         permitted_opens.add((host, port))
 
+    def _add_permitlisten(self, option: str, value: str) -> None:
+        """Add a permitlisten host/port pair"""
+
+        try:
+            host, port_str = value.rsplit(':', 1)
+
+            if host.startswith('[') and host.endswith(']'):
+                host = host[1:-1]
+
+            port = None if port_str == '*' else int(port_str)
+        except ValueError:
+            raise ValueError(f'Illegal permitlisten value: {value}') from None
+
+        if host == '*':
+            host = None
+
+        if port is not None and not 0 <= port <= 65535:
+            raise ValueError(f'Illegal permitlisten value: {value}')
+
+        permitted_listeners = cast(Set[Tuple[Optional[str], Optional[int]]],
+                                   self.options.setdefault(option, set()))
+        permitted_listeners.add((host, port))
+
     def _add_principals(self, option: str, value: str) -> None:
         """Add a principals wildcard pattern list"""
 
@@ -146,12 +169,13 @@ class _SSHAuthorizedKeyEntry(OptionsParser):
             subject_patterns.append(X509NamePattern(value))
 
     _handlers = {
-        'command':     _set_string,
-        'environment': _add_environment,
-        'from':        _add_from,
-        'permitopen':  _add_permitopen,
-        'principals':  _add_principals,
-        'subject':     _add_subject
+        'command':      _set_string,
+        'environment':  _add_environment,
+        'from':         _add_from,
+        'permitopen':   _add_permitopen,
+        'permitlisten': _add_permitlisten,
+        'principals':   _add_principals,
+        'subject':      _add_subject
     }
 
     def match_options(self, client_host: str, client_addr: str,

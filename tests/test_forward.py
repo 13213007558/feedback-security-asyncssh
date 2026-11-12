@@ -39,7 +39,7 @@ from asyncssh.socks import SOCKS5, SOCKS5_AUTH_NONE
 from asyncssh.socks import SOCKS4_OK_RESPONSE, SOCKS5_OK_RESPONSE_HDR
 
 from .server import Server, ServerTestCase
-from .util import asynctest, echo, make_certificate, try_remove
+from .util import AsyncTestCase, asynctest, echo, make_certificate, try_remove
 
 
 def _echo_non_async(stdin, stdout, stderr=None):
@@ -1054,6 +1054,572 @@ class _TestAsyncTCPForwarding(_TestTCPForwarding):
 
         return await cls.create_server(
             _TCPAsyncConnectionServer, authorized_client_keys='authorized_keys')
+
+
+class _NamedSocket(socket.socket):
+    """socketpair socket which reports a fixed loopback peer name"""
+
+    def __init__(self, real_sock, peer_name):
+        super().__init__(fileno=real_sock.detach())
+        self._peer_name = peer_name
+
+    def getpeername(self):
+        return self._peer_name
+
+
+def _named_socketpair():
+    """Return a socketpair whose ends report loopback peer names"""
+
+    client_sock, server_sock = socket.socketpair()
+    return (_NamedSocket(client_sock, ('127.0.0.1', 51001)),
+            _NamedSocket(server_sock, ('127.0.0.1', 51002)))
+
+
+class _FakeTCPListener(asyncssh.SSHListener):
+    """A fake TCP listener which never binds a real socket"""
+
+    def __init__(self, listen_host, listen_port, assigned_port):
+        super().__init__()
+
+        self.listen_host = listen_host
+        self.listen_port = (assigned_port if listen_port == 0
+                            else listen_port)
+        self.closed = False
+
+    def get_port(self):
+        """Return the port this fake listener is bound to"""
+
+        return self.listen_port
+
+    def close(self):
+        """Mark this fake listener as closed without touching a socket"""
+
+        super().close()
+        self.closed = True
+
+    async def wait_closed(self):
+        """Wait for this fake listener to finish closing"""
+
+
+class _PermitListenServer(Server):
+    """Server which grants remote listeners using a fake listener factory"""
+
+    def __init__(self, start_port=40000):
+        super().__init__()
+
+        self._next_port = start_port
+        self.listeners = []
+
+    def _new_listener(self, listen_host, listen_port):
+        """Create a fake listener, assigning a port for dynamic requests"""
+
+        if listen_port == 0:
+            assigned_port = self._next_port
+            self._next_port += 1
+        else:
+            assigned_port = listen_port
+
+        listener = _FakeTCPListener(listen_host, listen_port, assigned_port)
+        self.listeners.append(listener)
+        return listener
+
+    def server_requested(self, listen_host, listen_port):
+        """Handle a request to create a new socket listener"""
+
+        return self._new_listener(listen_host, listen_port)
+
+    def unix_server_requested(self, listen_path):
+        """UNIX domain listeners are unaffected by permitlisten"""
+
+        return False
+
+
+class _AsyncPermitListenServer(_PermitListenServer):
+    """Variant of the permitlisten server with an async request hook"""
+
+    async def server_requested(self, listen_host, listen_port):
+        """Handle a request to create a new socket listener"""
+
+        return self._new_listener(listen_host, listen_port)
+
+
+class _CheckPermitListen(AsyncTestCase):
+    """Unit tests for authorized_keys permitlisten enforcement
+
+       These tests run an SSH client and server over an in-memory
+       socketpair and use a fake listener factory, so they require
+       neither real socket binding nor any optional key backends.
+
+    """
+
+    __test__ = False
+
+    _server_factory = _PermitListenServer
+
+    def _write_authorized_keys(self, options, ckey):
+        """Write an authorized_keys file carrying permitlisten options"""
+
+        with open('authorized_keys', 'w') as auth_keys:
+            auth_keys.write(options + ' '
+                            + ckey.export_public_key().decode())
+
+    async def _make_pair(self, server, skey, ckey, cert=None):
+        """Establish an SSH client/server pair over a socketpair"""
+
+        client_sock, server_sock = _named_socketpair()
+
+        server_task = asyncio.ensure_future(asyncssh.run_server(
+            server_sock, server_factory=lambda: server,
+            server_host_keys=[skey],
+            authorized_client_keys='authorized_keys'))
+
+        client_keys = [(ckey, cert)] if cert else [ckey]
+
+        conn = await asyncssh.run_client(
+            client_sock, username='ckey', client_keys=client_keys,
+            known_hosts=None)
+
+        server_conn = await server_task
+        return conn, server_conn
+
+    async def _denied(self, coro):
+        """Assert that a forwarding request is rejected before binding"""
+
+        with self.assertRaises(asyncssh.ChannelListenError):
+            await coro
+
+    @asynctest
+    async def test_permitlisten_allowed(self):
+        """Test a listener request matching a permitlisten entry"""
+
+        skey = asyncssh.generate_private_key('ssh-ed25519')
+        ckey = asyncssh.generate_private_key('ssh-ed25519')
+        self._write_authorized_keys('permitlisten="127.0.0.1:8080"', ckey)
+
+        server = self._server_factory()
+        conn, _ = await self._make_pair(server, skey, ckey)
+
+        try:
+            listener = await conn.forward_remote_port(
+                '127.0.0.1', 8080, '127.0.0.1', 7)
+            self.assertEqual(listener.get_port(), 8080)
+            self.assertEqual(len(server.listeners), 1)
+            self.assertFalse(server.listeners[0].closed)
+
+            listener.close()
+            await listener.wait_closed()
+            self.assertTrue(server.listeners[0].closed)
+        finally:
+            conn.close()
+            await conn.wait_closed()
+
+    @asynctest
+    async def test_permitlisten_denied_wildcard_bind(self):
+        """Test that a wildcard bind is not covered by a loopback entry"""
+
+        skey = asyncssh.generate_private_key('ssh-ed25519')
+        ckey = asyncssh.generate_private_key('ssh-ed25519')
+        self._write_authorized_keys('permitlisten="127.0.0.1:8080"', ckey)
+
+        server = self._server_factory()
+        conn, _ = await self._make_pair(server, skey, ckey)
+
+        try:
+            for listen_host in ('', '0.0.0.0', '::'):
+                await self._denied(conn.forward_remote_port(
+                    listen_host, 8080, '127.0.0.1', 7))
+
+            self.assertEqual(server.listeners, [])
+        finally:
+            conn.close()
+            await conn.wait_closed()
+
+    @asynctest
+    async def test_permitlisten_denied_textually_similar_address(self):
+        """Test that textually similar addresses are not equivalent"""
+
+        skey = asyncssh.generate_private_key('ssh-ed25519')
+        ckey = asyncssh.generate_private_key('ssh-ed25519')
+        self._write_authorized_keys('permitlisten="127.0.0.1:8080"', ckey)
+
+        server = self._server_factory()
+        conn, _ = await self._make_pair(server, skey, ckey)
+
+        try:
+            for listen_host in ('localhost', '::1', '127.0.0.2'):
+                with self.subTest(listen_host=listen_host):
+                    await self._denied(conn.forward_remote_port(
+                        listen_host, 8080, '127.0.0.1', 7))
+
+            await self._denied(conn.forward_remote_port(
+                '127.0.0.1', 9090, '127.0.0.1', 7))
+
+            self.assertEqual(server.listeners, [])
+        finally:
+            conn.close()
+            await conn.wait_closed()
+
+    @asynctest
+    async def test_permitlisten_host_case_insensitive(self):
+        """Test host names match case-insensitively but not by IP form"""
+
+        skey = asyncssh.generate_private_key('ssh-ed25519')
+        ckey = asyncssh.generate_private_key('ssh-ed25519')
+        self._write_authorized_keys('permitlisten="LocalHost:8080"', ckey)
+
+        server = self._server_factory()
+        conn, _ = await self._make_pair(server, skey, ckey)
+
+        try:
+            for listen_host in ('localhost', 'LOCALHOST', 'LocalHost'):
+                with self.subTest(listen_host=listen_host):
+                    listener = await conn.forward_remote_port(
+                        listen_host, 8080, '127.0.0.1', 7)
+                    self.assertEqual(listener.get_port(), 8080)
+                    listener.close()
+                    await listener.wait_closed()
+
+            # The loopback IP is a different textual host, not equivalent
+            await self._denied(conn.forward_remote_port(
+                '127.0.0.1', 8080, '127.0.0.1', 7))
+        finally:
+            conn.close()
+            await conn.wait_closed()
+
+    @asynctest
+    async def test_permitlisten_denied_dynamic_port(self):
+        """Test that port 0 is not granted by a fixed-port entry"""
+
+        skey = asyncssh.generate_private_key('ssh-ed25519')
+        ckey = asyncssh.generate_private_key('ssh-ed25519')
+        self._write_authorized_keys('permitlisten="127.0.0.1:8080"', ckey)
+
+        server = self._server_factory()
+        conn, _ = await self._make_pair(server, skey, ckey)
+
+        try:
+            await self._denied(conn.forward_remote_port(
+                '127.0.0.1', 0, '127.0.0.1', 7))
+            self.assertEqual(server.listeners, [])
+        finally:
+            conn.close()
+            await conn.wait_closed()
+
+    @asynctest
+    async def test_permitlisten_ipv6_literal(self):
+        """Test an IPv6 literal entry does not also grant IPv4 loopback"""
+
+        skey = asyncssh.generate_private_key('ssh-ed25519')
+        ckey = asyncssh.generate_private_key('ssh-ed25519')
+        self._write_authorized_keys('permitlisten="[::1]:8080"', ckey)
+
+        server = self._server_factory()
+        conn, _ = await self._make_pair(server, skey, ckey)
+
+        try:
+            listener = await conn.forward_remote_port(
+                '::1', 8080, '127.0.0.1', 7)
+            self.assertEqual(listener.get_port(), 8080)
+
+            await self._denied(conn.forward_remote_port(
+                '127.0.0.1', 8080, '127.0.0.1', 7))
+
+            listener.close()
+            await listener.wait_closed()
+        finally:
+            conn.close()
+            await conn.wait_closed()
+
+    @asynctest
+    async def test_permitlisten_dynamic_port_wildcard(self):
+        """Test dynamic allocation under a wildcard-port entry"""
+
+        skey = asyncssh.generate_private_key('ssh-ed25519')
+        ckey = asyncssh.generate_private_key('ssh-ed25519')
+        self._write_authorized_keys('permitlisten="127.0.0.1:*"', ckey)
+
+        server = self._server_factory()
+        conn, server_conn = await self._make_pair(server, skey, ckey)
+
+        try:
+            listener = await conn.forward_remote_port(
+                '127.0.0.1', 0, '127.0.0.1', 7)
+
+            assigned_port = listener.get_port()
+            self.assertNotEqual(assigned_port, 0)
+            self.assertEqual(server.listeners[0].get_port(), assigned_port)
+            self.assertEqual(
+                server_conn._local_listeners,
+                {('127.0.0.1', assigned_port): server.listeners[0]})
+
+            listener.close()
+            await listener.wait_closed()
+            self.assertTrue(server.listeners[0].closed)
+            self.assertEqual(server_conn._local_listeners, {})
+        finally:
+            conn.close()
+            await conn.wait_closed()
+
+    @asynctest
+    async def test_permitlisten_dynamic_port_zero_entry(self):
+        """Test that a port 0 entry only grants dynamic allocation"""
+
+        skey = asyncssh.generate_private_key('ssh-ed25519')
+        ckey = asyncssh.generate_private_key('ssh-ed25519')
+        self._write_authorized_keys('permitlisten="127.0.0.1:0"', ckey)
+
+        server = self._server_factory()
+        conn, _ = await self._make_pair(server, skey, ckey)
+
+        try:
+            listener = await conn.forward_remote_port(
+                '127.0.0.1', 0, '127.0.0.1', 7)
+            self.assertNotEqual(listener.get_port(), 0)
+            listener.close()
+            await listener.wait_closed()
+
+            await self._denied(conn.forward_remote_port(
+                '127.0.0.1', 8080, '127.0.0.1', 7))
+        finally:
+            conn.close()
+            await conn.wait_closed()
+
+    @asynctest
+    async def test_permitlisten_full_wildcard(self):
+        """Test a wildcard host and port entry grants any bind"""
+
+        skey = asyncssh.generate_private_key('ssh-ed25519')
+        ckey = asyncssh.generate_private_key('ssh-ed25519')
+        self._write_authorized_keys('permitlisten="*:*"', ckey)
+
+        server = self._server_factory()
+        conn, _ = await self._make_pair(server, skey, ckey)
+
+        try:
+            listener1 = await conn.forward_remote_port(
+                '0.0.0.0', 8080, '127.0.0.1', 7)
+            listener2 = await conn.forward_remote_port(
+                '::1', 0, '127.0.0.1', 7)
+
+            self.assertEqual(listener1.get_port(), 8080)
+            self.assertNotEqual(listener2.get_port(), 0)
+
+            listener1.close()
+            listener2.close()
+            await listener1.wait_closed()
+            await listener2.wait_closed()
+        finally:
+            conn.close()
+            await conn.wait_closed()
+
+    @asynctest
+    async def test_permitlisten_cancel_by_original_request(self):
+        """Test cancellation of a dynamic listener using the original request"""
+
+        skey = asyncssh.generate_private_key('ssh-ed25519')
+        ckey = asyncssh.generate_private_key('ssh-ed25519')
+        self._write_authorized_keys('permitlisten="127.0.0.1:*"', ckey)
+
+        server = self._server_factory()
+        conn, server_conn = await self._make_pair(server, skey, ckey)
+
+        try:
+            listener = await conn.forward_remote_port(
+                '127.0.0.1', 0, '127.0.0.1', 7)
+            assigned_port = listener.get_port()
+
+            # Cancel by the original (host, 0) request tuple
+            pkttype, _ = await conn._make_global_request(
+                b'cancel-tcpip-forward', String('127.0.0.1'), UInt32(0))
+            self.assertEqual(pkttype, asyncssh.MSG_REQUEST_SUCCESS)
+            self.assertTrue(server.listeners[0].closed)
+            self.assertNotIn(('127.0.0.1', assigned_port),
+                             server_conn._local_listeners)
+
+            # Re-cancel by the now-unbound assigned port fails cleanly
+            pkttype, _ = await conn._make_global_request(
+                b'cancel-tcpip-forward', String('127.0.0.1'),
+                UInt32(assigned_port))
+            self.assertEqual(pkttype, asyncssh.MSG_REQUEST_FAILURE)
+
+            # The connection survives a failed cancel and still works
+            listener2 = await conn.forward_remote_port(
+                '127.0.0.1', 0, '127.0.0.1', 7)
+            self.assertNotEqual(listener2.get_port(), 0)
+            listener2.close()
+            await listener2.wait_closed()
+        finally:
+            conn.close()
+            await conn.wait_closed()
+
+    @asynctest
+    async def test_permitlisten_cancel_by_assigned_port(self):
+        """Test cancellation by assigned port removes the right object"""
+
+        skey = asyncssh.generate_private_key('ssh-ed25519')
+        ckey = asyncssh.generate_private_key('ssh-ed25519')
+        self._write_authorized_keys('permitlisten="127.0.0.1:*"', ckey)
+
+        server = self._server_factory()
+        conn, server_conn = await self._make_pair(server, skey, ckey)
+
+        try:
+            listeners = await asyncio.gather(*(
+                conn.forward_remote_port('127.0.0.1', 0, '127.0.0.1', 7)
+                for _ in range(3)))
+            ports = [listener.get_port() for listener in listeners]
+            self.assertEqual(len(set(ports)), 3)
+
+            # Cancel the middle listener by its assigned port
+            pkttype, _ = await conn._make_global_request(
+                b'cancel-tcpip-forward', String('127.0.0.1'),
+                UInt32(ports[1]))
+            self.assertEqual(pkttype, asyncssh.MSG_REQUEST_SUCCESS)
+            self.assertTrue(server.listeners[1].closed)
+            self.assertFalse(server.listeners[0].closed)
+            self.assertFalse(server.listeners[2].closed)
+            self.assertNotIn(('127.0.0.1', ports[1]),
+                             server_conn._local_listeners)
+
+            # A (host, 0) cancel now targets the oldest remaining (FIFO)
+            pkttype, _ = await conn._make_global_request(
+                b'cancel-tcpip-forward', String('127.0.0.1'), UInt32(0))
+            self.assertEqual(pkttype, asyncssh.MSG_REQUEST_SUCCESS)
+            self.assertTrue(server.listeners[0].closed)
+            self.assertFalse(server.listeners[2].closed)
+
+            listeners[2].close()
+            await listeners[2].wait_closed()
+            self.assertEqual(server_conn._local_listeners, {})
+        finally:
+            conn.close()
+            await conn.wait_closed()
+
+    @asynctest
+    async def test_permitlisten_cancel_isolated_between_connections(self):
+        """Test cancellation on one connection does not close another's"""
+
+        skey = asyncssh.generate_private_key('ssh-ed25519')
+        ckey = asyncssh.generate_private_key('ssh-ed25519')
+        self._write_authorized_keys('permitlisten="127.0.0.1:*"', ckey)
+
+        server1 = self._server_factory(start_port=45000)
+        server2 = self._server_factory(start_port=45000)
+
+        conn1, _ = await self._make_pair(server1, skey, ckey)
+
+        try:
+            listener1 = await conn1.forward_remote_port(
+                '127.0.0.1', 0, '127.0.0.1', 7)
+
+            conn2, _ = await self._make_pair(server2, skey, ckey)
+            try:
+                listener2 = await conn2.forward_remote_port(
+                    '127.0.0.1', 0, '127.0.0.1', 7)
+
+                # Both connections may assign the same port number
+                self.assertEqual(listener1.get_port(), listener2.get_port())
+
+                listener1.close()
+                await listener1.wait_closed()
+                self.assertTrue(server1.listeners[0].closed)
+                self.assertFalse(server2.listeners[0].closed)
+
+                listener2.close()
+                await listener2.wait_closed()
+                self.assertTrue(server2.listeners[0].closed)
+            finally:
+                conn2.close()
+                await conn2.wait_closed()
+        finally:
+            conn1.close()
+            await conn1.wait_closed()
+
+    @asynctest
+    async def test_permitlisten_cleanup_on_disconnect(self):
+        """Test permitted listeners are closed when the connection drops"""
+
+        skey = asyncssh.generate_private_key('ssh-ed25519')
+        ckey = asyncssh.generate_private_key('ssh-ed25519')
+        self._write_authorized_keys('permitlisten="127.0.0.1:8080"', ckey)
+
+        server = self._server_factory()
+        conn, server_conn = await self._make_pair(server, skey, ckey)
+
+        await conn.forward_remote_port('127.0.0.1', 8080, '127.0.0.1', 7)
+        fake_listener = server.listeners[0]
+        self.assertEqual(len(server_conn._local_listeners), 1)
+
+        conn.close()
+        await conn.wait_closed()
+        await asyncio.sleep(0.05)
+
+        self.assertTrue(fake_listener.closed)
+
+    @asynctest
+    async def test_permitlisten_does_not_apply_to_unix_forwarding(self):
+        """Test permitlisten has no effect on UNIX domain socket forwarding"""
+
+        skey = asyncssh.generate_private_key('ssh-ed25519')
+        ckey = asyncssh.generate_private_key('ssh-ed25519')
+        self._write_authorized_keys('permitlisten="127.0.0.1:8080"', ckey)
+
+        server = self._server_factory()
+        conn, _ = await self._make_pair(server, skey, ckey)
+
+        try:
+            # The UNIX request is not matched against permitlisten; the
+            # application hook returns False here, yielding a clean failure.
+            pkttype, _ = await conn._make_global_request(
+                b'streamlocal-forward@openssh.com', String('some/path'))
+            self.assertEqual(pkttype, asyncssh.MSG_REQUEST_FAILURE)
+        finally:
+            conn.close()
+            await conn.wait_closed()
+
+    @asynctest
+    async def test_no_port_forwarding_takes_precedence(self):
+        """Test no-port-forwarding rejects requests even when permitted"""
+
+        skey = asyncssh.generate_private_key('ssh-ed25519')
+        ckey = asyncssh.generate_private_key('ssh-ed25519')
+        cert = ckey.generate_user_certificate(
+            ckey, 'name', principals=['ckey'],
+            permit_port_forwarding=False)
+
+        with open('authorized_keys', 'w') as auth_keys:
+            auth_keys.write('cert-authority,permitlisten="127.0.0.1:8080" '
+                            + ckey.export_public_key().decode())
+
+        server = self._server_factory()
+        conn, _ = await self._make_pair(server, skey, ckey, cert)
+
+        try:
+            await self._denied(conn.forward_remote_port(
+                '127.0.0.1', 8080, '127.0.0.1', 7))
+            self.assertEqual(server.listeners, [])
+        finally:
+            conn.close()
+            await conn.wait_closed()
+
+
+class _TestPermitListen(_CheckPermitListen):
+    """Unit tests for permitlisten with a synchronous server hook"""
+
+    __test__ = True
+
+    _server_factory = _PermitListenServer
+
+
+class _TestAsyncPermitListen(_CheckPermitListen):
+    """Unit tests for permitlisten with an asynchronous server hook"""
+
+    __test__ = True
+
+    _server_factory = _AsyncPermitListenServer
+
+
+
 
 
 @unittest.skipIf(sys.platform == 'win32',

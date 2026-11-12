@@ -138,6 +138,21 @@ class _TestAuthorizedKeys(TempDirTestCase):
              {'permitopen': {('fe80::1', 123)}}),
             ('PermitOpen wildcard port', 'permitopen="xxx:*"',
              {'permitopen': {('xxx', None)}}),
+            ('PermitListen', 'permitlisten="xxx:123"',
+             {'permitlisten': {('xxx', 123)}}),
+            ('PermitListen IPv6 address',
+             'permitlisten="[fe80::1]:123"',
+             {'permitlisten': {('fe80::1', 123)}}),
+            ('PermitListen loopback', 'permitlisten="localhost:8080"',
+             {'permitlisten': {('localhost', 8080)}}),
+            ('PermitListen wildcard port', 'permitlisten="localhost:*"',
+             {'permitlisten': {('localhost', None)}}),
+            ('PermitListen dynamic port', 'permitlisten="localhost:0"',
+             {'permitlisten': {('localhost', 0)}}),
+            ('PermitListen wildcard host', 'permitlisten="*:123"',
+             {'permitlisten': {(None, 123)}}),
+            ('PermitListen wildcard host and port', 'permitlisten="*:*"',
+             {'permitlisten': {(None, None)}}),
             ('Unknown option', 'foo=abc,foo=def', {'foo': ['abc', 'def']}),
             ('Escaped value', 'environment="FOO=\\"xxx\\""',
              {'environment': {'FOO': '"xxx"'}})
@@ -215,7 +230,11 @@ class _TestAuthorizedKeys(TempDirTestCase):
             ('Environment missing equals', 'environment="FOO"\n'),
             ('Environment missing variable name', 'environment="=xxx"\n'),
             ('PermitOpen missing colon', 'permitopen="xxx"\n'),
-            ('PermitOpen non-integer port', 'permitopen="xxx:yyy"\n')
+            ('PermitOpen non-integer port', 'permitopen="xxx:yyy"\n'),
+            ('PermitListen missing colon', 'permitlisten="xxx"\n'),
+            ('PermitListen non-integer port', 'permitlisten="xxx:yyy"\n'),
+            ('PermitListen port out of range',
+             'permitlisten="xxx:65536"\n')
         )
 
         for msg, data in tests:

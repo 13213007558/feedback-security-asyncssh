@@ -1872,7 +1872,20 @@ AsyncSSH supports OpenSSH-style authorized_keys files, including the
 cert-authority option to validate user certificates, enforcement of
 from and principals options to restrict key matching, enforcement
 of no-X11-forwarding, no-agent-forwarding, no-pty, no-port-forwarding,
-and permitopen options, and support for command and environment options.
+permitopen, and permitlisten options, and support for command and
+environment options.
+
+The permitlisten option restricts the TCP/IP addresses and ports a
+client is allowed to request remote listeners on, taking the form
+``permitlisten="[host:]port"``. Multiple permitlisten options may be
+specified and a request is allowed if it matches any of them. The host
+and port may each be set to ``*`` as a wildcard, IPv6 addresses are
+written in brackets, and a port of ``0`` specifically authorizes dynamic
+port allocation. Addresses are matched textually, so an entry for
+``127.0.0.1`` does not also grant ``localhost`` or ``::1``. This option
+only governs TCP/IP remote forwarding and has no effect on UNIX domain
+socket forwarding, which remains controlled by no-port-forwarding and
+the application's server hooks.
 
 .. index:: Specifying authorized keys
 .. _SpecifyingAuthorizedKeys:

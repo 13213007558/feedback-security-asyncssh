@@ -1023,6 +1023,7 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
             'List[asyncio.Future[_GlobalRequestResult]]' = []
 
         self._local_listeners: Dict[ListenKey, SSHListener] = {}
+        self._dynamic_tcp_listeners: Dict[str, List[HostPort]] = {}
 
         self._x11_listener: Union[None, SSHX11ClientListener,
                                   SSHX11ServerListener] = None
@@ -6475,6 +6476,37 @@ class SSHServerConnection(SSHConnection):
 
         return chan, session
 
+    def _check_permitlisten(self, listen_host: str,
+                            listen_port: int) -> bool:
+        """Check a TCP/IP listener request against permitlisten options
+
+           Address matching is intentionally done on the text of the
+           request rather than by normalizing equivalent IP forms: an
+           authorization for ``127.0.0.1`` does not grant ``localhost``
+           or ``::1``, and vice versa. A host of ``None`` matches any
+           requested host, while a requested port of 0 (dynamic port
+           allocation) only matches entries whose port is ``0`` or the
+           wildcard port ``None``.
+
+        """
+
+        permitted_listeners = cast(
+            Optional[Set[Tuple[Optional[str], Optional[int]]]],
+            self.get_key_option('permitlisten'))
+
+        if not permitted_listeners:
+            return True
+
+        for permitted_host, permitted_port in permitted_listeners:
+            if permitted_host is not None and \
+                    permitted_host.lower() != listen_host:
+                continue
+
+            if permitted_port is None or permitted_port == listen_port:
+                return True
+
+        return False
+
     def _process_tcpip_forward_global_request(self, packet: SSHPacket) -> None:
         """Process an incoming TCP/IP port forwarding request"""
 
@@ -6496,11 +6528,20 @@ class SSHServerConnection(SSHConnection):
             self._report_global_response(False)
             return
 
+        if not self._check_permitlisten(listen_host, listen_port):
+            self.logger.info('Request for TCP listener on %s denied by '
+                             'permitlisten', (listen_host, listen_port))
+
+            self._report_global_response(False)
+            return
+
         self.create_task(self._finish_port_forward(listen_host, listen_port))
 
     async def _finish_port_forward(self, listen_host: str,
                                    listen_port: int) -> None:
         """Finish processing a TCP/IP port forwarding request"""
+
+        dynamic_request = listen_port == 0
 
         listener = self._owner.server_requested(listen_host, listen_port)
 
@@ -6530,7 +6571,7 @@ class SSHServerConnection(SSHConnection):
         listener: SSHListener
         result: Union[bool, bytes]
 
-        if listen_port == 0:
+        if dynamic_request:
             listen_port = listener.get_port()
             result = UInt32(listen_port)
         else:
@@ -6539,7 +6580,13 @@ class SSHServerConnection(SSHConnection):
         self.logger.info('Created TCP listener on %s',
                          (listen_host, listen_port))
 
-        self._local_listeners[listen_host, listen_port] = listener
+        actual_key: HostPort = (listen_host, listen_port)
+        self._local_listeners[actual_key] = listener
+
+        if dynamic_request:
+            self._dynamic_tcp_listeners.setdefault(
+                listen_host, []).append(actual_key)
+
         self._report_global_response(result)
 
     def _process_cancel_tcpip_forward_global_request(
@@ -6556,13 +6603,35 @@ class SSHServerConnection(SSHConnection):
             raise ProtocolError('Invalid TCP/IP cancel '
                                 'forward request') from None
 
-        try:
-            listener = self._local_listeners.pop((listen_host, listen_port))
-        except KeyError:
-            raise ProtocolError('TCP/IP listener not found') from None
+        request_key: HostPort = (listen_host, listen_port)
+        dynamic_keys = self._dynamic_tcp_listeners.get(listen_host)
 
-        self.logger.info('Closed TCP listener on %s',
-                         (listen_host, listen_port))
+        if listen_port == 0:
+            # A dynamic request only identifies the host; cancel the
+            # oldest outstanding dynamic listener on that host.
+            if not dynamic_keys:
+                self._report_global_response(False)
+                return
+
+            actual_key = dynamic_keys.pop(0)
+            if not dynamic_keys:
+                del self._dynamic_tcp_listeners[listen_host]
+        elif dynamic_keys and request_key in dynamic_keys:
+            # Cancellation by the dynamically assigned port.
+            actual_key = request_key
+            dynamic_keys.remove(actual_key)
+            if not dynamic_keys:
+                del self._dynamic_tcp_listeners[listen_host]
+        elif request_key in self._local_listeners:
+            # Cancellation of a fixed-port listener by its request key.
+            actual_key = request_key
+        else:
+            self._report_global_response(False)
+            return
+
+        listener = self._local_listeners.pop(actual_key)
+
+        self.logger.info('Closed TCP listener on %s', actual_key)
 
         listener.close()
 
@@ -6894,6 +6963,7 @@ class SSHServerConnection(SSHConnection):
                | from (list of host patterns)
                | no-touch-required (boolean)
                | permitopen (list of host/port tuples)
+               | permitlisten (list of host/port tuples)
                | principals (list of usernames)
 
            Non-standard options are also supported and will return the
